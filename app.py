@@ -527,38 +527,67 @@ def scrape_website_with_retry(url, max_retries=2):
     return result
 
 
-def call_gemini_with_retry(api_key, model_id, prompt, system_instruction=None, max_retries=2):
-    """Gemini API call with model selection"""
+def call_gemini_with_retry(api_key, model_id, prompt, system_instruction=None, max_retries=3):
+    """Gemini API call with model selection and better error handling"""
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={api_key}"
     
     for attempt in range(max_retries):
         try:
             payload = {
                 "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": 0.4, "maxOutputTokens": 300}
+                "generationConfig": {"temperature": 0.4, "maxOutputTokens": 500}
             }
             
             if system_instruction:
                 payload["systemInstruction"] = {"parts": [{"text": system_instruction}]}
             
-            response = requests.post(url, json=payload, timeout=25)
+            response = requests.post(url, json=payload, timeout=30)
             
             if response.status_code == 429:
-                time.sleep(2)
+                time.sleep(3)
                 continue
+            
+            if response.status_code == 404:
+                return None, f"Model '{model_id}' not found - try another model"
+            
+            if response.status_code == 400:
+                error_data = response.json()
+                error_msg = error_data.get('error', {}).get('message', 'Bad request')
+                return None, f"API Error: {error_msg[:50]}"
             
             response.raise_for_status()
             result = response.json()
             
+            # Better response parsing
             if 'candidates' in result and len(result['candidates']) > 0:
-                text = result['candidates'][0]['content']['parts'][0]['text'].strip()
-                return text, None
+                candidate = result['candidates'][0]
+                if 'content' in candidate and 'parts' in candidate['content']:
+                    parts = candidate['content']['parts']
+                    if parts and 'text' in parts[0]:
+                        text = parts[0]['text'].strip()
+                        return text, None
+                    else:
+                        return None, "No text in response"
+                else:
+                    # Check for blocked content
+                    finish_reason = candidate.get('finishReason', '')
+                    if finish_reason == 'SAFETY':
+                        return None, "Content blocked by safety filter"
+                    return None, f"Invalid response structure: {finish_reason}"
             else:
-                return None, "No response"
+                # Check for prompt feedback
+                if 'promptFeedback' in result:
+                    block_reason = result['promptFeedback'].get('blockReason', 'Unknown')
+                    return None, f"Prompt blocked: {block_reason}"
+                return None, "No candidates in response"
                 
+        except requests.exceptions.Timeout:
+            if attempt == max_retries - 1:
+                return None, "Request timeout"
+            time.sleep(2)
         except Exception as e:
             if attempt == max_retries - 1:
-                return None, str(e)
+                return None, str(e)[:50]
             time.sleep(1)
     
     return None, "Max retries exceeded"
