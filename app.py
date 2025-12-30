@@ -280,6 +280,10 @@ if 'is_processing' not in st.session_state:
     st.session_state.is_processing = False
 if 'stop_processing' not in st.session_state:
     st.session_state.stop_processing = False
+if 'auto_save_enabled' not in st.session_state:
+    st.session_state.auto_save_enabled = False
+if 'processed_urls' not in st.session_state:
+    st.session_state.processed_urls = set()
 
 # ═══════════════════════════════════════════════════════════════
 # NEW AUTHORITY-FOCUSED PROMPTS
@@ -756,6 +760,99 @@ def save_to_google_sheets_custom(credentials_json, sheet_id, leads_data, selecte
         return 0, str(e)
 
 
+def get_existing_linkedin_urls(credentials_json, sheet_id):
+    """Get already processed LinkedIn URLs from Google Sheets to avoid duplicates"""
+    try:
+        from google.oauth2.service_account import Credentials
+        from googleapiclient.discovery import build
+        
+        SCOPES = ['https://www.googleapis.com/auth/spreadsheets.readonly']
+        creds = Credentials.from_service_account_info(credentials_json, scopes=SCOPES)
+        service = build('sheets', 'v4', credentials=creds)
+        
+        spreadsheet = service.spreadsheets().get(spreadsheetId=sheet_id).execute()
+        first_sheet_name = spreadsheet['sheets'][0]['properties']['title']
+        
+        # Get all data from column A to Z
+        result = service.spreadsheets().values().get(
+            spreadsheetId=sheet_id,
+            range=f"'{first_sheet_name}'!A:Z"
+        ).execute()
+        
+        values = result.get('values', [])
+        if not values:
+            return set()
+        
+        # Find LinkedIn URL column
+        headers = values[0] if values else []
+        linkedin_col_idx = None
+        for idx, header in enumerate(headers):
+            if 'linkedin' in header.lower():
+                linkedin_col_idx = idx
+                break
+        
+        if linkedin_col_idx is None:
+            return set()
+        
+        # Extract all LinkedIn URLs
+        existing_urls = set()
+        for row in values[1:]:
+            if len(row) > linkedin_col_idx:
+                url = row[linkedin_col_idx].strip()
+                if url:
+                    existing_urls.add(url)
+        
+        return existing_urls
+    except Exception as e:
+        return set()
+
+
+def append_single_lead_to_sheets(credentials_json, sheet_id, lead_data, selected_columns):
+    """Append a single processed lead to Google Sheets (for auto-save)"""
+    try:
+        from google.oauth2.service_account import Credentials
+        from googleapiclient.discovery import build
+        
+        SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
+        creds = Credentials.from_service_account_info(credentials_json, scopes=SCOPES)
+        service = build('sheets', 'v4', credentials=creds)
+        
+        spreadsheet = service.spreadsheets().get(spreadsheetId=sheet_id).execute()
+        first_sheet_name = spreadsheet['sheets'][0]['properties']['title']
+        
+        num_cols = len(selected_columns)
+        end_col = chr(ord('A') + num_cols - 1) if num_cols <= 26 else 'Z'
+        
+        # Prepare single row
+        row = []
+        for col in selected_columns:
+            if col == 'location':
+                loc_parts = []
+                for f in ['company_city', 'company_state', 'company_country']:
+                    val = lead_data.get(f, '')
+                    if val and str(val).lower() not in ['none', 'nan', '']:
+                        loc_parts.append(str(val))
+                row.append(', '.join(loc_parts))
+            else:
+                val = lead_data.get(col, '')
+                if str(val).lower() in ['none', 'nan']:
+                    val = ''
+                row.append(str(val) if val else '')
+        
+        # Append row
+        service.spreadsheets().values().append(
+            spreadsheetId=sheet_id,
+            range=f"'{first_sheet_name}'!A:{end_col}",
+            valueInputOption='RAW',
+            insertDataOption='INSERT_ROWS',
+            body={'values': [row]}
+        ).execute()
+        
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
 def process_single_lead(lead, gemini_key, model_id, delay=1.5):
     """Process single lead with new Authority prompts"""
     result = lead.copy()
@@ -908,6 +1005,22 @@ with st.sidebar:
     st.markdown("### ⚙️ Settings")
     
     delay_seconds = st.slider("Request Delay (sec)", 1.0, 5.0, 1.5, 0.5)
+    
+    st.markdown("---")
+    st.markdown("### 💾 Auto-Save (Cloud Run Friendly)")
+    
+    auto_save = st.checkbox(
+        "Enable Auto-Save",
+        value=st.session_state.auto_save_enabled,
+        help="প্রতিটা lead process হলেই Google Sheets এ save হবে। Timeout হলেও data safe থাকবে!"
+    )
+    st.session_state.auto_save_enabled = auto_save
+    
+    if auto_save:
+        st.success("✅ Auto-save ON - Duplicate skip করবে")
+        skip_existing = st.checkbox("Skip already processed leads", value=True, help="Sheets এ আগে থেকে আছে এমন leads skip করবে")
+    else:
+        skip_existing = False
 
 # ═══════════════════════════════════════════════════════════════
 # STEP 1: GET LEADS
@@ -1051,6 +1164,7 @@ else:
             progress_bar = st.progress(0)
             status_text = st.empty()
             current_lead = st.empty()
+            auto_save_status = st.empty()
             results_area = st.container()
             
             leads_to_process = st.session_state.filtered_leads[start_index-1:end_index]
@@ -1058,11 +1172,37 @@ else:
             
             success_count = 0
             fail_count = 0
+            skip_count = 0
+            auto_saved_count = 0
+            
+            # Get existing URLs if skip_existing is enabled
+            existing_urls = set()
+            if st.session_state.auto_save_enabled and skip_existing and credentials_file and sheet_id:
+                try:
+                    creds = json.load(credentials_file)
+                    credentials_file.seek(0)  # Reset file pointer
+                    existing_urls = get_existing_linkedin_urls(creds, sheet_id)
+                    if existing_urls:
+                        st.info(f"📋 Found {len(existing_urls)} already processed leads - will skip duplicates")
+                except:
+                    pass
+            
+            # Get selected columns for auto-save
+            default_columns = ['first_name', 'last_name', 'linkedin_url', 'company_name', 'company_website', 'icebreaker']
             
             for i, lead in enumerate(leads_to_process):
                 if st.session_state.stop_processing:
                     st.warning(f"⏹️ Stopped at {i+1}")
                     break
+                
+                # Check for duplicate
+                linkedin_url = lead.get('linkedin_url', '')
+                if linkedin_url and linkedin_url in existing_urls:
+                    skip_count += 1
+                    progress = (i + 1) / total
+                    progress_bar.progress(progress)
+                    status_text.markdown(f"**Processing {i+1}/{total}** ({progress*100:.0f}%) - ⏭️ Skipped {skip_count} duplicates")
+                    continue
                 
                 progress = (i + 1) / total
                 progress_bar.progress(progress)
@@ -1076,6 +1216,20 @@ else:
                 
                 if result['status'] == 'success':
                     success_count += 1
+                    
+                    # Auto-save to Google Sheets if enabled
+                    if st.session_state.auto_save_enabled and credentials_file and sheet_id:
+                        try:
+                            creds = json.load(credentials_file)
+                            credentials_file.seek(0)
+                            saved, err = append_single_lead_to_sheets(creds, sheet_id, result, default_columns)
+                            if saved:
+                                auto_saved_count += 1
+                                existing_urls.add(linkedin_url)  # Add to processed set
+                                auto_save_status.success(f"💾 Auto-saved: {auto_saved_count} leads")
+                        except Exception as e:
+                            pass
+                    
                     with results_area:
                         st.markdown(f"""
                         <div class="success-card">
@@ -1097,13 +1251,18 @@ else:
             status_text.markdown("✅ **Complete!**")
             current_lead.empty()
             
-            col1, col2, col3 = st.columns(3)
+            col1, col2, col3, col4 = st.columns(4)
             with col1:
                 st.metric("Total", len(st.session_state.processed_results))
             with col2:
                 st.metric("✅ Success", success_count)
             with col3:
                 st.metric("❌ Failed", fail_count)
+            with col4:
+                st.metric("⏭️ Skipped", skip_count)
+            
+            if auto_saved_count > 0:
+                st.success(f"💾 Auto-saved {auto_saved_count} leads to Google Sheets!")
 
 st.markdown("---")
 
