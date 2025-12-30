@@ -548,46 +548,73 @@ def call_gemini_with_retry(api_key, model_id, prompt, system_instruction=None, m
                 continue
             
             if response.status_code == 404:
-                return None, f"Model '{model_id}' not found - try another model"
+                return None, f"Model '{model_id}' not available"
             
             if response.status_code == 400:
-                error_data = response.json()
-                error_msg = error_data.get('error', {}).get('message', 'Bad request')
-                return None, f"API Error: {error_msg[:50]}"
+                try:
+                    error_data = response.json()
+                    error_msg = error_data.get('error', {}).get('message', 'Bad request')
+                    return None, f"API Error: {str(error_msg)[:50]}"
+                except:
+                    return None, f"Bad request (400)"
             
-            response.raise_for_status()
-            result = response.json()
+            if response.status_code != 200:
+                return None, f"HTTP {response.status_code}"
             
-            # Better response parsing
-            if 'candidates' in result and len(result['candidates']) > 0:
-                candidate = result['candidates'][0]
-                if 'content' in candidate and 'parts' in candidate['content']:
-                    parts = candidate['content']['parts']
-                    if parts and 'text' in parts[0]:
-                        text = parts[0]['text'].strip()
-                        return text, None
-                    else:
-                        return None, "No text in response"
-                else:
-                    # Check for blocked content
-                    finish_reason = candidate.get('finishReason', '')
-                    if finish_reason == 'SAFETY':
-                        return None, "Content blocked by safety filter"
-                    return None, f"Invalid response structure: {finish_reason}"
-            else:
+            try:
+                result = response.json()
+            except Exception as je:
+                return None, f"JSON parse error: {str(je)[:30]}"
+            
+            # Better response parsing with safety checks
+            if not result:
+                return None, "Empty response"
+            
+            if 'error' in result:
+                err_msg = result.get('error', {}).get('message', 'Unknown error')
+                return None, f"API: {str(err_msg)[:40]}"
+            
+            if 'candidates' not in result or len(result.get('candidates', [])) == 0:
                 # Check for prompt feedback
                 if 'promptFeedback' in result:
                     block_reason = result['promptFeedback'].get('blockReason', 'Unknown')
-                    return None, f"Prompt blocked: {block_reason}"
-                return None, "No candidates in response"
+                    return None, f"Blocked: {block_reason}"
+                return None, "No candidates"
+            
+            candidate = result['candidates'][0]
+            
+            # Check finish reason
+            finish_reason = candidate.get('finishReason', '')
+            if finish_reason == 'SAFETY':
+                return None, "Blocked by safety filter"
+            
+            # Extract text safely
+            content = candidate.get('content', {})
+            parts = content.get('parts', [])
+            
+            if not parts:
+                return None, f"No parts in response (finish: {finish_reason})"
+            
+            if 'text' not in parts[0]:
+                return None, "No text in parts"
+            
+            text = parts[0]['text']
+            if not text or not isinstance(text, str):
+                return None, "Empty text response"
+            
+            return text.strip(), None
                 
         except requests.exceptions.Timeout:
             if attempt == max_retries - 1:
                 return None, "Request timeout"
             time.sleep(2)
+        except requests.exceptions.RequestException as re:
+            if attempt == max_retries - 1:
+                return None, f"Network: {str(re)[:30]}"
+            time.sleep(1)
         except Exception as e:
             if attempt == max_retries - 1:
-                return None, str(e)[:50]
+                return None, f"Error: {str(e)[:40]}"
             time.sleep(1)
     
     return None, "Max retries exceeded"
