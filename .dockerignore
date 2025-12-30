@@ -1,0 +1,21 @@
+# Ignore files for Docker build
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.env
+.venv
+env/
+venv/
+ENV/
+.git
+.gitignore
+.dockerignore
+Dockerfile
+README.md
+*.md
+.DS_Store
+*.log
+.idea/
+.vscode/
